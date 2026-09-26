@@ -1,0 +1,13 @@
+# VoiceDesignCloner - Irodori-TTS only install (no Qwen3-TTS)
+# Used by setup.bat / setup.sh when VDC_SKIP_QWEN=1.
+# torch / torchaudio are installed by setup (CUDA or CPU auto-detected).
+# Irodori-TTS itself runs in its own venv under ~/.vdc-engines/Irodori-TTS.
+
+gradio>=6.0
+huggingface_hub
+librosa
+numpy
+soundfile
+# M2M-100 translation button and the optional Whisper quality check
+transformers
+sentencepiece

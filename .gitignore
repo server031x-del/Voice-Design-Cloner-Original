@@ -1,0 +1,45 @@
+# 仮想環境
+venv/
+.venv/
+
+# Pythonキャッシュ
+__pycache__/
+*.pyc
+*.pyo
+
+# モデルキャッシュ（手動配置した場合）
+models/
+
+# 環境変数
+.env
+*.log
+
+# パッケージビルド
+*.egg-info/
+dist/
+build/
+
+# qwen3-tts を直下にcloneした場合
+qwen3-tts/
+
+# 外部エンジン（setup.bat / setup.sh が %USERPROFILE%\.vdc-engines\ にclone）
+# プロジェクトディレクトリには展開しないが、誤って配置された場合の保険として残す
+engines/
+
+# ユーザー個別設定（言語・バックエンド選択など）。
+# 初回起動時に config.example.json から作成される。
+config.json
+
+# VSCode
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated output, private references, and browser captures
+/output/*
+!/output/.gitignore
+/references/
+/.playwright-cli/
+/.playwright-mcp/
