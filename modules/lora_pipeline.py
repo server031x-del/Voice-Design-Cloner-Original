@@ -20,10 +20,9 @@ import subprocess
 import sys
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterator
 
 from config import BASE_DIR, OUTPUT_DIR
 from modules.dataset_io import find_text_list, read_text_list
@@ -32,19 +31,6 @@ from modules.gpu_gate import GPUBusyError, get_gate, gpu_session, wait_messages 
 from modules.irodori_bridge import _default_irodori_root
 
 logger = logging.getLogger(__name__)
-
-
-class SubprocessFailed(RuntimeError):
-    """Raised when an external Irodori command exits non-zero."""
-
-    def __init__(self, cmd: list[str], returncode: int, stderr_tail: Iterable[str]):
-        self.cmd = cmd
-        self.returncode = returncode
-        self.stderr_tail = tuple(stderr_tail)
-        message = f"subprocess exited with code {returncode}: {' '.join(cmd)}"
-        if self.stderr_tail:
-            message += "\nlast stderr:\n" + "\n".join(self.stderr_tail)
-        super().__init__(message)
 
 LORA_OUTPUT_DIR = OUTPUT_DIR / "lora"
 LORA_DATA_DIR = OUTPUT_DIR / "lora_data"
@@ -447,13 +433,9 @@ def _stream_subprocess(
         env=env,
     )
 
-    stderr_tail: deque[str] = deque(maxlen=50)
-
     def _drain_stderr(stream):
         for line in stream:
-            text = line.rstrip()
-            stderr_tail.append(text)
-            logger.warning("[subprocess] %s", text)
+            logger.warning("[subprocess] %s", line.rstrip())
 
     stderr_thread = threading.Thread(target=_drain_stderr, args=(proc.stderr,), daemon=True)
     stderr_thread.start()
@@ -483,7 +465,7 @@ def _stream_subprocess(
     if cancelled:
         return
     if proc.returncode != 0:
-        raise SubprocessFailed(cmd, proc.returncode, stderr_tail)
+        raise RuntimeError(f"subprocess exited with code {proc.returncode}: {' '.join(cmd)}")
 
 
 def _irodori_python() -> Path:
@@ -655,24 +637,16 @@ def run_lora_pipeline(
             latent_dir = latents_root / safe_speaker
             encode_script = BASE_DIR / "modules" / "irodori_encode_latents.py"
             yield _stage("encode_latents", message="Encoding waveforms to latents")
-            if manifest_path.exists():
-                manifest_path.unlink()
-            encode_error: SubprocessFailed | None = None
-            encode_cmd = [
-                str(py), str(encode_script),
-                "--input-jsonl", str(jsonl_path),
-                "--latent-dir", str(latent_dir),
-                "--manifest", str(manifest_path),
-            ]
-            try:
-                list(_stream_subprocess(encode_cmd, cwd=irodori_root))
-            except SubprocessFailed as exc:
-                encode_error = exc
+            list(_stream_subprocess(
+                [
+                    str(py), str(encode_script),
+                    "--input-jsonl", str(jsonl_path),
+                    "--latent-dir", str(latent_dir),
+                    "--manifest", str(manifest_path),
+                ],
+                cwd=irodori_root,
+            ))
             if not manifest_path.is_file():
-                if encode_error is not None:
-                    raise RuntimeError(
-                        f"encode_latents failed before producing manifest: {manifest_path}"
-                    ) from encode_error
                 raise RuntimeError(f"encode_latents did not produce manifest: {manifest_path}")
         else:
             yield _stage(
@@ -681,30 +655,9 @@ def run_lora_pipeline(
             )
         manifest_count = _count_nonempty_lines(manifest_path)
         if manifest_count == 0:
-            message = (
+            raise RuntimeError(
                 f"encode_latents wrote 0 entries to {manifest_path}. "
                 "All audio files were rejected; check the [subprocess] logs above for skip reasons."
-            )
-            if resume_from is None and encode_error is not None:
-                raise RuntimeError(message) from encode_error
-            raise RuntimeError(message)
-        if resume_from is None and encode_error is not None:
-            if manifest_count < n_utts:
-                raise RuntimeError(
-                    f"encode_latents exited non-zero after writing only "
-                    f"{manifest_count}/{n_utts} entries to {manifest_path}"
-                ) from encode_error
-            logger.warning(
-                "encode_latents exited non-zero after writing %s/%s manifest entries; continuing",
-                manifest_count, n_utts,
-            )
-            yield _stage(
-                "encode_latents_warning",
-                message=(
-                    "Encoder exited non-zero after writing a complete manifest; "
-                    "continuing to training."
-                ),
-                entries=manifest_count,
             )
         n_utts = manifest_count
         yield _stage(

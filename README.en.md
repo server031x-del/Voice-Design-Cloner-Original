@@ -9,10 +9,6 @@ From voice design and bulk synthesis for [Style-Bert-VITS2](https://github.com/l
 
 **Switch UI language, bundled corpus, and generation language with one click — JA / EN / ZH / KO supported**
 
-## Google Colab
-
-See [`colab/README.md`](colab/README.md) for the notebook and setup instructions.
-
 ---
 
 ## Overview
@@ -241,6 +237,7 @@ The legacy Irodori screens remain available. Use the top-level **Irodori V4** ta
 - **Quality check**: signal checks (truncation, silence, clipping, speaking-rate outliers) run after each batch; optional Whisper transcription with CER. Rejected clips can be excluded from the training list or regenerated with a new seed (also available in the Tools tab)
 - **LoRA checkpoint comparison**: evenly spaced checkpoints are kept; render the same lines with a fixed seed, listen, and adopt the best step as that LoRA's default. Small datasets train on all clips instead of a noisy one-clip validation split
 - **Resume LoRA training** from the newest checkpoint; a fresh run moves the previous one into `_archive/`
+- **Gemini voice design → Irodori clone**: design a voice from a description with Gemini TTS (`gemini-3.8-flash-tts`), render a ~30 s reference with it into `output/voice_design/`, then clone it locally with Irodori V4 from "saved Voice Design" (requires `GEMINI_API_KEY`; Gemini output is 24 kHz). The Gemini API Additional Terms forbid using the Services to develop competing models, so check them before training on Gemini-derived audio
 - **GPU job queueing**: overlapping generation / training / QC jobs wait for the running one instead of failing
 - **Translator in Irodori mode**: the optional M2M100 translator is not preloaded onto the GPU and is loaded on CPU only when a translation button is used
 

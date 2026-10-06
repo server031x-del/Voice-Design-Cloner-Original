@@ -19,7 +19,7 @@ from modules.gpu_gate import wait_messages
 from modules.irodori_jobs import RELEASE_IDLE, RELEASE_IMMEDIATE, RELEASE_KEEP, format_batch_result
 from modules.lora_pipeline import get_lora_adapter_path, list_loras
 from modules.model_manager import ModelManager
-from modules.utils import format_duration, list_corpus_files, load_corpus
+from modules.utils import format_duration, load_corpora
 from modules.voice_clone import batch_clone_irodori_v4
 from modules.voice_design import (
     generate_irodori_v4,
@@ -29,6 +29,7 @@ from modules.voice_design import (
     list_kept_voice_labels_with_metadata,
     save_voice,
 )
+from ui.corpus_selector import build_corpus_selector
 from ui.qc_panel import build_qc_panel
 from ui.tab_gemini_voice import build_gemini_voice_tab
 from ui.tab_lora import build_lora_tab
@@ -36,13 +37,29 @@ from ui.tab_lora import build_lora_tab
 logger = logging.getLogger(__name__)
 
 _LORA_NONE = "—"
+_FULL_PRECISION_VARIANTS = {"full", "small-meanflow", "large-full"}
+_SMALL_V4_VARIANTS = {
+    "full",
+    "int8-weight-only",
+    "int8-dynamic",
+    "int4-weight-only",
+    "float8-weight-only",
+    "float8-dynamic",
+}
 _MODEL_CHOICES = [
-    ("Full BF16/FP32（最高品質・2.85 GiB）", "full"),
-    ("INT8 Weight-only（推奨軽量版・872 MiB）", "int8-weight-only"),
-    ("INT8 Dynamic（872 MiB）", "int8-dynamic"),
-    ("INT4 Weight-only（Ampere以降・813 MiB）", "int4-weight-only"),
-    ("FP8 Weight-only（Ada以降・873 MiB）", "float8-weight-only"),
-    ("FP8 Dynamic（Ada以降・906 MiB）", "float8-dynamic"),
+    ("v4.1-Small Full BF16/FP32（2.85 GiB）", "full"),
+    ("v4.1-Small INT8 Weight-only（872 MiB）", "int8-weight-only"),
+    ("v4.1-Small INT8 Dynamic（872 MiB）", "int8-dynamic"),
+    ("v4.1-Small INT4 Weight-only（Ampere以降・813 MiB）", "int4-weight-only"),
+    ("v4.1-Small FP8 Weight-only（Ada以降・873 MiB）", "float8-weight-only"),
+    ("v4.1-Small FP8 Dynamic（Ada以降・906 MiB）", "float8-dynamic"),
+    ("v4.1-Small MeanFlow（4 steps推奨・CFG固定）", "small-meanflow"),
+    ("v4-Large Full BF16/FP32（モデルファイル13.2 GB）", "large-full"),
+    ("v4-Large INT8 Weight-only（モデルファイル3,662 MiB）", "large-int8-weight-only"),
+    ("v4-Large INT8 Dynamic（モデルファイル3,662 MiB）", "large-int8-dynamic"),
+    ("v4-Large INT4 Weight-only（Ampere以降・2,818 MiB）", "large-int4-weight-only"),
+    ("v4-Large FP8 Weight-only（Ada以降・3,665 MiB）", "large-float8-weight-only"),
+    ("v4-Large FP8 Dynamic（Ada以降・3,659 MiB）", "large-float8-dynamic"),
 ]
 _RELEASE_CHOICES = [
     ("数分操作がなければ解放（推奨・連続生成が速い）", RELEASE_IDLE),
@@ -121,7 +138,37 @@ def _reference_summary(saved_label, uploaded_files) -> str:
 
 
 def _effective_precision(model_variant: str, precision: str) -> str:
-    return "bf16" if model_variant != "full" else precision
+    return precision if model_variant in _FULL_PRECISION_VARIANTS else "bf16"
+
+
+def _default_steps(model_variant: str) -> int:
+    return 4 if model_variant == "small-meanflow" else 40
+
+
+def _lora_update(model_variant: str):
+    compatible = model_variant in _SMALL_V4_VARIANTS
+    choices = [_LORA_NONE, *list_loras("v4")] if compatible else [_LORA_NONE]
+    return gr.update(choices=choices, value=_LORA_NONE, interactive=compatible)
+
+
+def _update_unified_model_controls(model_variant: str):
+    is_meanflow = model_variant == "small-meanflow"
+    return (
+        gr.update(value="bf16", interactive=model_variant in _FULL_PRECISION_VARIANTS),
+        gr.update(value=_default_steps(model_variant)),
+        gr.update(interactive=not is_meanflow),
+        gr.update(interactive=not is_meanflow),
+        gr.update(interactive=not is_meanflow),
+        _lora_update(model_variant),
+    )
+
+
+def _update_batch_model_controls(model_variant: str):
+    return (
+        gr.update(value="bf16", interactive=model_variant in _FULL_PRECISION_VARIANTS),
+        gr.update(value=_default_steps(model_variant)),
+        _lora_update(model_variant),
+    )
 
 
 def _resolve_seed(seed) -> int | None:
@@ -136,7 +183,7 @@ def _load_batch_texts(corpus_file, uploaded_file, count) -> list[str]:
         with open(uploaded_path, encoding="utf-8") as handle:
             texts = [line.strip() for line in handle if line.strip()]
     elif corpus_file:
-        texts = load_corpus(corpus_file, "ja")
+        texts = load_corpora(corpus_file, "ja")
     else:
         return []
     limit = int(count or 0)
@@ -167,9 +214,9 @@ def _release_v4_runtime_status() -> str:
 
 def build_irodori_v4_tab(manager: ModelManager):
     gr.Markdown(
-        "## Irodori-TTS V4.1 ワークスペース\n"
+        "## Irodori-TTS V4 / V4.1 ワークスペース\n"
         "ボイスデザイン・統合生成・一括クローン・LoRA学習を下のタブで選べます。従来モデルは上の「V3系」へ切り替えて使用できます。"
-        "V4.1 Small（発話長予測を改善）を使用します。新規LoRA学習もV4.1がベースです。"
+        "v4.1-Small、MeanFlow、v4-Largeを選択できます。V4 LoRA学習と既存LoRAはv4.1-Small系用です。"
     )
     gr.Markdown(
         "> **日本語専用 / 48kHz**　参照音声は同じ話者の短い綺麗なクリップを複数選び、"
@@ -336,9 +383,9 @@ def _build_unified_generation(manager: ModelManager, *, design_only: bool = Fals
         outputs=[lora],
     )
     model_variant.change(
-        fn=lambda variant: gr.update(value="bf16", interactive=(variant == "full")),
+        fn=_update_unified_model_controls,
         inputs=[model_variant],
-        outputs=[precision],
+        outputs=[precision, num_steps, cfg_text, cfg_caption, cfg_speaker, lora],
     )
     seed_clear.click(fn=lambda: None, outputs=[seed])
 
@@ -358,6 +405,7 @@ def _build_unified_generation(manager: ModelManager, *, design_only: bool = Fals
         caption_cfg,
         speaker_cfg,
         release,
+        progress=None,
     ):
         if not reading_text or not reading_text.strip():
             yield None, None, None, "エラー: 読み上げテキストを入力してください"
@@ -373,6 +421,11 @@ def _build_unified_generation(manager: ModelManager, *, design_only: bool = Fals
             yield gr.update(), gr.update(), gr.update(), message
         try:
             manager.unload_model()
+            def show_progress(event):
+                if progress is not None:
+                    progress(event.get("fraction") or 0, desc=event.get("message", "モデル準備中"))
+
+            yield gr.update(), gr.update(), gr.update(), "モデルを準備しています。初回はモデルのダウンロードが必要です。"
             sr, audio, info = generate_irodori_v4(
                 text=reading_text,
                 caption=caption_text,
@@ -388,6 +441,7 @@ def _build_unified_generation(manager: ModelManager, *, design_only: bool = Fals
                 cfg_scale_caption=float(caption_cfg),
                 cfg_scale_speaker=float(speaker_cfg),
                 release_mode=release,
+                progress_callback=show_progress,
             )
             mode = "Style Clone" if refs else "Voice Design"
             message = (
@@ -406,15 +460,19 @@ def _build_unified_generation(manager: ModelManager, *, design_only: bool = Fals
             yield None, None, None, f"エラー: {exc}"
 
     def on_generate(saved, uploaded, caption_text, reading_text, variant, precision_value, lora_name,
-                    seed_value, *rest):
+                    seed_value, steps, duration, max_ref, text_cfg, caption_cfg, speaker_cfg,
+                    release, progress=gr.Progress()):
         yield from _generate(saved, uploaded, caption_text, reading_text, variant, precision_value,
-                             lora_name, _resolve_seed(seed_value), *rest)
+                             lora_name, _resolve_seed(seed_value), steps, duration, max_ref,
+                             text_cfg, caption_cfg, speaker_cfg, release, progress=progress)
 
     def on_reroll(saved, uploaded, caption_text, reading_text, variant, precision_value, lora_name,
-                  seed_value, *rest):
+                  seed_value, steps, duration, max_ref, text_cfg, caption_cfg, speaker_cfg,
+                  release, progress=gr.Progress()):
         # Re-roll always explores a new voice, even if a seed is pinned.
         yield from _generate(saved, uploaded, caption_text, reading_text, variant, precision_value,
-                             lora_name, None, *rest)
+                             lora_name, None, steps, duration, max_ref,
+                             text_cfg, caption_cfg, speaker_cfg, release, progress=progress)
 
     generation_inputs = [
         saved_ref,
@@ -469,19 +527,24 @@ def _build_unified_generation(manager: ModelManager, *, design_only: bool = Fals
         def on_load_preset(label):
             metadata = get_kept_voice_metadata_by_label(label)
             if not metadata:
-                return [gr.update()] * 10 + ["保存済みの設定が見つかりません"]
+                return [gr.update()] * 12 + ["保存済みの設定が見つかりません"]
             s = metadata.get("settings", {})
             variant = s.get("model_variant", "full")
             return [
                 s.get("caption") or "",
                 metadata.get("text") or gr.update(),
                 variant,
-                gr.update(value=s.get("model_precision", "bf16"), interactive=(variant == "full")),
+                gr.update(
+                    value=s.get("model_precision", "bf16"),
+                    interactive=variant in _FULL_PRECISION_VARIANTS,
+                ),
+                _lora_update(variant),
                 metadata.get("used_seed"),
-                s.get("num_steps", 40),
+                s.get("num_steps", _default_steps(variant)),
                 s.get("duration_scale", 1.0),
-                s.get("cfg_scale_text", 3.0),
-                s.get("cfg_scale_caption", 3.0),
+                gr.update(value=s.get("cfg_scale_text", 3.0), interactive=variant != "small-meanflow"),
+                gr.update(value=s.get("cfg_scale_caption", 3.0), interactive=variant != "small-meanflow"),
+                gr.update(value=s.get("cfg_scale_speaker", 5.0), interactive=variant != "small-meanflow"),
                 label,
                 f"「{label}」の設定を読み込みました。{_metadata_summary(metadata)}",
             ]
@@ -489,8 +552,8 @@ def _build_unified_generation(manager: ModelManager, *, design_only: bool = Fals
         preset_load.click(
             fn=on_load_preset,
             inputs=[preset_voice],
-            outputs=[caption, text, model_variant, precision, seed, num_steps, duration_scale,
-                     cfg_text, cfg_caption, save_name, status],
+            outputs=[caption, text, model_variant, precision, lora, seed, num_steps,
+                     duration_scale, cfg_text, cfg_caption, cfg_speaker, save_name, status],
         )
 
     for button, emoji in emoji_buttons:
@@ -521,12 +584,7 @@ def _build_batch_generation(manager: ModelManager) -> None:
             ref_summary = gr.Textbox(label="参照音声情報", interactive=False, lines=4)
 
             gr.Markdown("### 2. 日本語コーパス")
-            corpus_files = list_corpus_files("ja")
-            corpus_file = gr.Dropdown(
-                choices=corpus_files,
-                value=corpus_files[0] if corpus_files else None,
-                label="内蔵コーパス",
-            )
+            corpus_file, _corpus_order = build_corpus_selector(default=None)
             uploaded_text = gr.File(label="または .txt（1行1文）", file_types=[".txt"], type="filepath")
             count = gr.Number(label="生成文数（0=すべて）", value=0, minimum=0, precision=0)
             caption = gr.Textbox(
@@ -596,9 +654,9 @@ def _build_batch_generation(manager: ModelManager) -> None:
         outputs=[saved_ref],
     )
     model_variant.change(
-        fn=lambda variant: gr.update(value="bf16", interactive=(variant == "full")),
+        fn=_update_batch_model_controls,
         inputs=[model_variant],
-        outputs=[precision],
+        outputs=[precision, num_steps, lora],
     )
 
     def on_batch(

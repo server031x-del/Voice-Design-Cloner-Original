@@ -28,6 +28,8 @@ import gc
 import json
 import os
 import sys
+import threading
+import time
 import traceback
 from dataclasses import fields
 from pathlib import Path
@@ -37,7 +39,6 @@ from typing import Any
 # bundled ``irodori_tts`` package is importable. Python doesn't add CWD to
 # sys.path automatically when running a script outside of it, so do it here.
 sys.path.insert(0, os.getcwd())
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 # Force stdin/stdout/stderr to UTF-8. The bridge writes UTF-8 JSON on stdin,
 # but on Japanese Windows the default Python text-mode encoding is cp932,
@@ -53,9 +54,12 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 # protocol. Capture the real stdout for our own use and redirect Python's
 # sys.stdout to stderr so every imported library logs there instead.
 _PROTOCOL_STDOUT = sys.stdout
+_PROTOCOL_LOCK = threading.Lock()
 sys.stdout = sys.stderr
 
-from huggingface_hub import hf_hub_download  # noqa: E402
+from huggingface_hub import hf_hub_download, snapshot_download  # noqa: E402
+from tqdm.auto import tqdm  # noqa: E402
+from irodori_precision import load_bf16_runtime  # noqa: E402
 
 from irodori_tts.inference_runtime import (  # noqa: E402
     InferenceRuntime,
@@ -82,9 +86,53 @@ V4_CHECKPOINTS = {
     "int4-weight-only": "Aratako/Irodori-TTS-v4.1-Small-Quantized/int4-weight-only",
     "float8-weight-only": "Aratako/Irodori-TTS-v4.1-Small-Quantized/float8-weight-only",
     "float8-dynamic": "Aratako/Irodori-TTS-v4.1-Small-Quantized/float8-dynamic",
+    "small-meanflow": "Aratako/Irodori-TTS-v4.1-Small-MF",
+    "large-full": "Aratako/Irodori-TTS-v4-Large",
+    "large-int8-weight-only": "Aratako/Irodori-TTS-v4-Large-Quantized/int8-weight-only",
+    "large-int8-dynamic": "Aratako/Irodori-TTS-v4-Large-Quantized/int8-dynamic",
+    "large-int4-weight-only": "Aratako/Irodori-TTS-v4-Large-Quantized/int4-weight-only",
+    "large-float8-weight-only": "Aratako/Irodori-TTS-v4-Large-Quantized/float8-weight-only",
+    "large-float8-dynamic": "Aratako/Irodori-TTS-v4-Large-Quantized/float8-dynamic",
 }
+FULL_PRECISION_VARIANTS = {"full", "small-meanflow", "large-full"}
 
 CODEC_REPO = "Aratako/Semantic-DACVAE-Japanese-32dim"
+
+
+class DownloadProgress(tqdm):
+    """Send byte progress over the worker protocol even without a terminal."""
+
+    def display(self, msg=None, pos=None):
+        if getattr(self, "unit", None) != "B":
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_last_protocol_update", 0.0) < 1.0:
+            return
+        self._last_protocol_update = now
+        total = getattr(self, "total", 0) or 0
+        downloaded = getattr(self, "n", 0)
+        if total <= 0 and downloaded <= 0:
+            return
+        phase = "モデル取得" if "Downloading" in (self.desc or "") else "モデルファイル構築"
+        message = f"{phase}: {downloaded / 1024**3:.2f} GiB"
+        if total > 0:
+            message += f" / {total / 1024**3:.2f} GiB（{min(downloaded / total, 1.0):.0%}）"
+        _emit({"event": "progress", "message": message,
+               "fraction": min(downloaded / total, 1.0) if total > 0 else None})
+
+
+def _download_v4_checkpoint(source: str) -> str:
+    owner, repo, *subfolder = source.split("/")
+    checkpoint = f"{subfolder[0]}/model.safetensors" if subfolder else "model.safetensors"
+    patterns = [checkpoint, "tokenizer/*"]
+    if subfolder:
+        patterns.append(f"{subfolder[0]}/tokenizer/*")
+    snapshot = Path(snapshot_download(repo_id=f"{owner}/{repo}", allow_patterns=patterns,
+                                      tqdm_class=DownloadProgress))
+    path = snapshot / checkpoint
+    if not path.is_file():
+        raise FileNotFoundError(f"Checkpoint missing: {path}")
+    return str(path)
 
 
 def _log(message: str) -> None:
@@ -150,14 +198,18 @@ class WorkerState:
                     "%USERPROFILE%\\.vdc-engines\\Irodori-TTS and run uv sync --extra cu128."
                 )
             repo = V4_CHECKPOINTS[model_variant]
-            precision = (model_precision or "bf16") if model_variant == "full" else "bf16"
-            if model_variant.startswith("int4") or model_variant.startswith("float8"):
+            precision = (
+                (model_precision or "bf16")
+                if model_variant in FULL_PRECISION_VARIANTS
+                else "bf16"
+            )
+            if "int4" in model_variant or "float8" in model_variant:
                 import torch
                 if not torch.cuda.is_available():
                     raise RuntimeError(f"{model_variant} requires an NVIDIA CUDA GPU")
                 major, minor = torch.cuda.get_device_capability()
                 capability = major + minor / 10.0
-                minimum = 8.9 if model_variant.startswith("float8") else 8.0
+                minimum = 8.9 if "float8" in model_variant else 8.0
                 if capability < minimum:
                     raise RuntimeError(
                         f"{model_variant} requires compute capability {minimum:.1f} or newer; "
@@ -184,14 +236,15 @@ class WorkerState:
             f"mode={mode}, precision={precision}."
         )
         _log(f"Checking/downloading checkpoint: {repo}")
+        _emit({"event": "progress", "message": f"モデル取得を確認しています: {repo}"})
         if profile == "v4":
-            ckpt = download_hf_checkpoint(repo)
+            ckpt = _download_v4_checkpoint(repo)
         else:
             ckpt = hf_hub_download(repo_id=repo, filename="model.safetensors")
         device = default_runtime_device()
         _log(f"Loading Irodori runtime on device={device}.")
-        self.runtime = InferenceRuntime.from_key(
-            RuntimeKey(
+        _emit({"event": "progress", "message": f"モデルを{device}へ読み込んでいます（{precision}）"})
+        key = RuntimeKey(
                 checkpoint=ckpt,
                 model_device=device,
                 codec_repo=CODEC_REPO,
@@ -203,7 +256,11 @@ class WorkerState:
                 compile_model=False,
                 compile_dynamic=False,
             )
-        )
+        if profile == "v4" and model_variant in FULL_PRECISION_VARIANTS and precision == "bf16":
+            from irodori_tts.model import TextToLatentRFDiT
+            self.runtime = load_bf16_runtime(InferenceRuntime.from_key, key, TextToLatentRFDiT)
+        else:
+            self.runtime = InferenceRuntime.from_key(key)
         self.runtime_profile = cache_profile
         _log(f"Runtime ready for profile={cache_profile}.")
         return self.runtime
@@ -297,7 +354,11 @@ def handle_synthesize(state: WorkerState, req: dict[str, Any]) -> dict[str, Any]
         lora_adapter=req.get("lora_path"),
         max_text_len=None,
         max_caption_len=None,
-        num_steps=int(req.get("num_steps", 40)),
+        num_steps=int(
+            req.get("num_steps")
+            if req.get("num_steps") is not None
+            else (4 if model_variant == "small-meanflow" else 40)
+        ),
         cfg_scale_text=float(req.get("cfg_scale_text", 3.0)),
         cfg_scale_caption=float(req.get("cfg_scale_caption", 3.0)),
         cfg_scale_speaker=float(req.get("cfg_scale_speaker", 5.0)),
@@ -334,6 +395,7 @@ def handle_synthesize(state: WorkerState, req: dict[str, Any]) -> dict[str, Any]
     response: dict[str, Any] | None = None
     try:
         _log("Generating audio...")
+        _emit({"event": "progress", "message": "音声を生成しています"})
         result = runtime.synthesize(sampling, log_fn=lambda msg: _log(str(msg)))
         _log(f"Saving wav: {out_path}")
         _save_wav_resampled(out_path, result.audio, result.sample_rate, target_sr)
@@ -369,8 +431,9 @@ def handle_synthesize(state: WorkerState, req: dict[str, Any]) -> dict[str, Any]
 
 
 def _emit(payload: dict[str, Any]) -> None:
-    _PROTOCOL_STDOUT.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    _PROTOCOL_STDOUT.flush()
+    with _PROTOCOL_LOCK:
+        _PROTOCOL_STDOUT.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        _PROTOCOL_STDOUT.flush()
 
 
 def main() -> int:

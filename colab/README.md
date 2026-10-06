@@ -1,6 +1,6 @@
 # VoiceDesignCloner on Google Colab
 
-The notebook in `colab/voice-design-cloner-colab.ipynb` runs the current source snapshot with an Irodori-TTS GPU runtime. It asks Gradio to create a temporary public share URL only when the app is launched from the notebook. Normal local startup remains private.
+The notebook in `output/jupyter-notebook/voice-design-cloner-colab.ipynb` runs the current source snapshot with an Irodori-TTS GPU runtime. It asks Gradio to create a temporary public share URL only when the app is launched from the notebook. Normal local startup remains private.
 
 ## Prepare the source bundle on Windows
 

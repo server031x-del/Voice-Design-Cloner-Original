@@ -54,6 +54,37 @@ def load_corpus(corpus_name: str, corpus_lang: str = "ja") -> list[str]:
         raise
 
 
+# Emotion range first (often generated already), then streaming talk, then
+# conversational AI-character lines.  Appending in this order lets an existing
+# ita_emotion100 dataset be extended in place.
+AITUBER_CORPUS_PRESET = ["ita_emotion100.txt", "aituber_stream200.txt", "aika500.txt"]
+
+
+def load_corpora(corpus_names, corpus_lang: str = "ja") -> list[str]:
+    """Concatenate several corpora in the given order."""
+    if isinstance(corpus_names, str):
+        corpus_names = [corpus_names]
+    lines: list[str] = []
+    for name in corpus_names or []:
+        lines.extend(load_corpus(name, corpus_lang))
+    return lines
+
+
+def describe_corpora(corpus_names, corpus_lang: str = "ja") -> str:
+    """Human-readable generation order, e.g. ``A（100文）→ B（200文）= 300文``."""
+    if isinstance(corpus_names, str):
+        corpus_names = [corpus_names]
+    parts, total = [], 0
+    for name in corpus_names or []:
+        try:
+            count = len(load_corpus(name, corpus_lang))
+        except Exception:
+            count = 0
+        total += count
+        parts.append(f"{name}（{count}文）")
+    return " → ".join(parts) + f" ＝ 合計{total}文" if parts else "コーパスが選択されていません"
+
+
 def list_corpus_files(corpus_lang: str = "ja") -> list[str]:
     _lang_folder = {"ja": "japanese", "en": "english", "zh": "chinese"}
     folder = CORPUS_DIR / _lang_folder.get(corpus_lang, "japanese")

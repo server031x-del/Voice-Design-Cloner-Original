@@ -32,7 +32,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +225,7 @@ class IrodoriBridge:
         except Exception:
             logger.exception("Failed to kill Irodori worker")
 
-    def _wait_response(self) -> dict[str, Any]:
+    def _wait_response(self, progress_callback: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
         """Wait for the next protocol message, enforcing the inactivity timeout.
 
         Caller must hold ``self._lock``.
@@ -248,15 +248,23 @@ class IrodoriBridge:
                 err = self._collected_stderr()
                 self._kill_locked()
                 raise IrodoriUnavailable(f"Irodori worker exited without a response. stderr={err!r}")
+            if item.get("event") == "progress":
+                self._last_activity = time.monotonic()
+                if progress_callback is not None:
+                    try:
+                        progress_callback(item)
+                    except Exception:
+                        logger.exception("Failed to display Irodori progress")
+                continue
             return item
 
-    def _send(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _send(self, payload: dict[str, Any], *, progress_callback=None) -> dict[str, Any]:
         with self._lock:
             if self._proc is None or self._proc.poll() is not None:
                 raise IrodoriUnavailable("Irodori worker is not running")
             self._proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
             self._proc.stdin.flush()
-            return self._wait_response()
+            return self._wait_response(progress_callback)
 
     # ------------------------------------------------------------------ idle release
 
@@ -336,6 +344,7 @@ class IrodoriBridge:
         cfg_scale_caption: float | None = None,
         cfg_scale_speaker: float | None = None,
         release_after_synthesis: bool | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Run one synthesis. Starts worker if needed. Synchronous."""
         self.cancel_idle_release()
@@ -370,7 +379,7 @@ class IrodoriBridge:
             req["ref_wavs"] = [str(path) for path in ref_wavs]
         if lora_path is not None:
             req["lora_path"] = str(lora_path)
-        resp = self._send(req)
+        resp = self._send(req) if progress_callback is None else self._send(req, progress_callback=progress_callback)
         if not resp.get("ok"):
             msg = resp.get("error") or "Irodori worker reported failure"
             trace = resp.get("trace")

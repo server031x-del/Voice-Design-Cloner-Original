@@ -217,6 +217,54 @@ def load_manifest(base_dir: str | Path) -> dict | None:
     return read_json(Path(base_dir) / MANIFEST_NAME)
 
 
+class BatchConflictError(RuntimeError):
+    """Resuming into this folder would overwrite or drop finished lines."""
+
+
+def _settings_diff(old: dict, new: dict) -> list[str]:
+    def flat(settings: dict) -> dict:
+        items = {f"request.{k}": v for k, v in (settings.get("request") or {}).items()}
+        items.update({k: v for k, v in settings.items() if k != "request"})
+        return items
+
+    a, b = flat(old or {}), flat(new or {})
+    return sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+
+
+def check_batch_conflict(previous: dict, lines: Sequence[str], settings: dict, key: str) -> None:
+    """Refuse to silently destroy finished lines when resuming into a folder.
+
+    Adding more text is done by keeping the earlier lines first (e.g. corpus A,
+    then A + B): those ids are reused and only the new lines are generated.
+    Anything that would replace or drop finished lines — different settings,
+    a different line at the same position, or fewer lines — raises instead;
+    the caller can use another folder or turn resume off to start over.
+    """
+    finished = {r["id"]: r for r in previous.get("records", []) if r.get("status") == "done"}
+    if not finished:
+        return
+    advice = "追加する場合は前回と同じ設定・同じ順番（前回の文を先頭）にしてください。作り直す場合は別フォルダにするか「続きから再開」をオフにしてください。"
+    if previous.get("settings_key") != key:
+        changed = _settings_diff(previous.get("settings") or {}, settings)
+        raise BatchConflictError(
+            f"このフォルダには生成済みの{len(finished)}行がありますが、生成設定が前回と違います"
+            f"（{', '.join(changed) or '設定'}）。このまま続けると全行が作り直されます。{advice}"
+        )
+    replaced = [
+        index for index, text in enumerate(lines, start=1)
+        if f"{index:04d}" in finished and finished[f"{index:04d}"].get("text") != text
+    ]
+    if replaced:
+        raise BatchConflictError(
+            f"このフォルダの生成済みの行（{replaced[0]}行目など計{len(replaced)}行）が別の文で上書きされます。{advice}"
+        )
+    dropped = [file_id for file_id in finished if int(file_id) > len(lines)]
+    if dropped:
+        raise BatchConflictError(
+            f"指定した文数（{len(lines)}行）が前回より少なく、生成済みの{len(dropped)}行がテキストリストから外れます。{advice}"
+        )
+
+
 def _file_fingerprint(path: str | Path) -> str:
     path = Path(path)
     try:
@@ -280,10 +328,9 @@ def run_irodori_batch(
     previous_records: dict[str, dict] = {}
     notice = ""
     if previous:
+        check_batch_conflict(previous, lines, settings, key)
         if previous.get("settings_key") == key:
             previous_records = {r["id"]: r for r in previous.get("records", [])}
-        else:
-            notice = "前回と生成設定が異なるため、全行を生成し直します。"
 
     records: list[dict] = []
     todo: list[dict] = []

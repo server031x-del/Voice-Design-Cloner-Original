@@ -117,6 +117,7 @@ def generate_irodori_v4(
     cfg_scale_caption: float = 3.0,
     cfg_scale_speaker: float = 5.0,
     release_mode: str = "idle",
+    progress_callback=None,
 ):
     """Generate with the unified Irodori v4 text/ref/caption checkpoint.
 
@@ -164,6 +165,7 @@ def generate_irodori_v4(
                     seed=seed,
                     no_ref=not refs,
                     release_after_synthesis=(release_mode == "immediate"),
+                    progress_callback=progress_callback,
                     **settings,
                 )
             finally:

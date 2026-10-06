@@ -175,13 +175,47 @@ class BatchRunnerTests(unittest.TestCase):
         self.assertEqual(result["total_files"], 3)
         self.assertEqual(result["skipped_existing"], 2)
 
-    def test_changed_settings_regenerate_everything(self):
+    def test_changed_settings_are_refused_instead_of_regenerating(self):
         texts = ["いちばんめ", "にばんめ"]
         self._run(FakeBridge(), texts)
         second = FakeBridge()
-        self._run(second, texts, request={"profile": "v4", "mode": "clone", "target_sr": 44100,
-                                          "caption": "明るく"})
+        with self.assertRaisesRegex(irodori_jobs.BatchConflictError, "request.caption"):
+            self._run(second, texts, request={"profile": "v4", "mode": "clone", "target_sr": 44100,
+                                              "caption": "明るく"})
+        self.assertEqual(second.calls, [])
+        # Turning resume off is the explicit way to start over.
+        self._run(second, texts, resume=False,
+                  request={"profile": "v4", "mode": "clone", "target_sr": 44100, "caption": "明るく"})
         self.assertEqual(len(second.calls), 2)
+
+    def test_appending_a_corpus_reuses_finished_lines(self):
+        self._run(FakeBridge(), ["感情いち", "感情に"])
+        second = FakeBridge()
+        result = self._run(second, ["感情いち", "感情に", "配信いち", "配信に"])
+        self.assertEqual([c["text"] for c in second.calls], ["配信いち", "配信に"])
+        self.assertEqual(result["total_files"], 4)
+        self.assertEqual(len(read_text_list(self.base / "Neutral.txt")), 4)
+
+    def test_different_corpus_in_same_folder_is_refused(self):
+        self._run(FakeBridge(), ["感情いち", "感情に"])
+        second = FakeBridge()
+        with self.assertRaisesRegex(irodori_jobs.BatchConflictError, "上書き"):
+            self._run(second, ["配信いち", "配信に", "配信さん"])
+        self.assertEqual(second.calls, [])
+        self.assertEqual([e[1] for e in read_text_list(self.base / "Neutral.txt")], ["感情いち", "感情に"])
+
+    def test_fewer_lines_is_refused(self):
+        self._run(FakeBridge(), ["いち", "に", "さん"])
+        with self.assertRaisesRegex(irodori_jobs.BatchConflictError, "少なく"):
+            self._run(FakeBridge(), ["いち"])
+
+    def test_aituber_preset_corpora_exist(self):
+        from modules.utils import AITUBER_CORPUS_PRESET, describe_corpora, load_corpora
+
+        lines = load_corpora(AITUBER_CORPUS_PRESET, "ja")
+        self.assertEqual(len(lines), 100 + 200 + 500)
+        self.assertEqual(len(set(load_corpora(["aituber_stream200.txt"], "ja"))), 200)
+        self.assertIn("合計800文", describe_corpora(AITUBER_CORPUS_PRESET))
 
     def test_redo_ids_regenerate_with_a_new_seed(self):
         texts = ["いちばんめ", "にばんめ"]
@@ -322,6 +356,26 @@ class BridgeTimeoutTests(unittest.TestCase):
         bridge._stdout_queue.put(_EOF)
         with self.assertRaises(IrodoriUnavailable):
             bridge._wait_response()
+
+    def test_download_progress_does_not_finish_request(self):
+        bridge = self._bridge(10)
+        event = {"event": "progress", "message": "モデル取得: 1.00 / 12.27 GiB", "fraction": 0.08}
+        bridge._stdout_queue.put(event)
+        bridge._stdout_queue.put({"ok": True, "out_path": "sample.wav"})
+        received = []
+        response = bridge._wait_response(received.append)
+        self.assertEqual(received, [event])
+        self.assertEqual(response, {"ok": True, "out_path": "sample.wav"})
+
+    def test_progress_keeps_download_alive_without_stderr(self):
+        bridge = self._bridge(0.6)
+        def download():
+            for _ in range(4):
+                time.sleep(0.3)
+                bridge._stdout_queue.put({"event": "progress", "message": "取得中"})
+            bridge._stdout_queue.put({"ok": True})
+        threading.Thread(target=download, daemon=True).start()
+        self.assertEqual(bridge._wait_response(), {"ok": True})
 
     def test_idle_release_shuts_down_when_gpu_is_free(self):
         bridge = self._bridge(10)
